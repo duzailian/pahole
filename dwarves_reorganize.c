@@ -321,7 +321,7 @@ static void class__move_member(struct class *class, struct class_member *dest,
 		}
 	} else if (from_was_last) {
 		class->type.size -= from_size + class->padding;
-	} else {
+	} else if (from->bitfield_size == 0) {
 		/*
 		 * See if we are adding a new hole that is bigger than
 		 * sizeof(long), this may have problems with explicit alignment
