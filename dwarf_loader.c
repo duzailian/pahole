@@ -2240,6 +2240,8 @@ static void lexblock__recode_dwarf_types(struct lexblock *tag, struct cu *cu)
 				tag__print_type_not_found(pos);
 				continue;
 			}
+			assert(dtype->tag->tag == DW_TAG_subprogram ||
+			       dtype->tag->tag == DW_TAG_subroutine_type);
 			ftype__recode_dwarf_types(dtype->tag, cu);
 			continue;
 
