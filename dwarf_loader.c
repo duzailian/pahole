@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <inttypes.h>
 #include <libelf.h>
 #include <limits.h>
 #include <pthread.h>
@@ -83,6 +84,7 @@ static void __tag__print_not_supported(uint32_t tag, const char *func)
 
 struct dwarf_off_ref {
 	unsigned int	from_types : 1;
+	unsigned int	from_alt : 1;
 	Dwarf_Off	off;
 };
 
@@ -112,12 +114,13 @@ static void dwarf_tag__set_spec(struct dwarf_tag *dtag, dwarf_off_ref spec)
 	*(dwarf_off_ref *)(dtag + 1) = spec;
 }
 
+// alt: Alternative DWARF file, i.e. .dwz
 struct dwarf_cu {
 	struct hlist_head *hash_tags;
 	struct hlist_head *hash_types;
 	struct dwarf_tag *last_type_lookup;
 	struct cu *cu;
-	struct dwarf_cu *type_unit;
+	struct dwarf_cu *type_unit, *alt;
 };
 
 static int dwarf_cu__init(struct dwarf_cu *dcu, struct cu *cu)
@@ -175,8 +178,8 @@ static void dwarf_cu__delete(struct cu *cu)
 static void __tag__print_type_not_found(struct tag *tag, const char *func)
 {
 	struct dwarf_tag *dtag = tag->priv;
-	fprintf(stderr, "%s: couldn't find %#llx type for %#llx (%s)!\n", func,
-		(unsigned long long)dtag->type.off, (unsigned long long)dtag->id,
+	fprintf(stderr, "%s: couldn't find %#llx (from_alt=%u) type for %#llx (%s)!\n", func,
+		(unsigned long long)dtag->type.off, dtag->type.from_alt, (unsigned long long)dtag->id,
 		dwarf_tag_name(tag->tag));
 }
 
@@ -215,6 +218,9 @@ static void cu__hash(struct cu *cu, struct tag *tag)
 	struct hlist_head *hashtable = tag__is_tag_type(tag) ?
 							dcu->hash_types :
 							dcu->hash_tags;
+
+	struct dwarf_tag *dtag = tag->priv;
+	fprintf(stderr, "%30s:%4d cu: %p off %#" PRIx64 " tag %p type: %#" PRIx64 " dtag->type.from_alt:%d %s\n", __func__, __LINE__, cu, dtag->id, tag, dtag->type.off, dtag->type.from_alt, dwarf_tag_name(tag->tag));
 	hashtags__hash(hashtable, tag->priv);
 }
 
@@ -225,7 +231,9 @@ static struct dwarf_tag *dwarf_cu__find_tag_by_ref(const struct dwarf_cu *cu,
 		return NULL;
 	if (ref->from_types) {
 		return NULL;
-	}
+	} else if (ref->from_alt)
+		cu = cu->alt;
+
 	return hashtags__find(cu->hash_tags, ref->off);
 }
 
@@ -239,6 +247,11 @@ static struct dwarf_tag *dwarf_cu__find_type_by_ref(struct dwarf_cu *dcu,
 		if (dcu == NULL) {
 			return NULL;
 		}
+	} else if (ref->from_alt) {
+		fprintf(stderr, "%s:%d from_alt: off=%#" PRIx64 " dcu=%p, dcu->alt=%p!!!!\n", __func__, __LINE__, ref->off, dcu, dcu->alt);
+		dcu = dcu->alt;
+		if (dcu == NULL)
+			return NULL;
 	}
 
 	if (dcu->last_type_lookup->id == ref->off)
@@ -418,6 +431,10 @@ static struct dwarf_off_ref attr_type(Dwarf_Die *die, uint32_t attr_name, struct
 		if (dwarf_formref_die(&attr, &type_die) != NULL) {
 			ref.from_types = attr.form == DW_FORM_ref_sig8;
 			ref.off = dwarf_dieoffset(&type_die);
+
+			// We mark its from alt so that when doing type lookups we use dcu->alt
+			if (attr.form == DW_FORM_GNU_ref_alt || conf->alt_dwarf || conf->from_imported_unit_expansion_from_alt)
+				ref.from_alt = 1;
 			return ref;
 		}
 	}
@@ -514,6 +531,9 @@ static void tag__init(struct tag *tag, struct cu *cu, Dwarf_Die *die, struct con
 	}
 
 	INIT_LIST_HEAD(&tag->node);
+
+	fprintf(stderr, "%30s:%4d cu: %p off %#" PRIx64 " tag %p type: %#" PRIx64 " dtag->type.from_alt:%d dtag->abstract_origin.from_alt:%d conf->alt_dwarf:%d %s\n",
+			__func__, __LINE__, cu, dtag->id, tag, dtag->type.off, dtag->type.from_alt, dtag->abstract_origin.from_alt, conf->alt_dwarf, dwarf_tag_name(tag->tag));
 }
 
 static struct tag *tag__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
@@ -1994,8 +2014,6 @@ static struct tag *__die__process_tag(Dwarf_Die *die, struct cu *cu,
 	struct tag *tag = NULL;
 
 	switch (dwarf_tag(die)) {
-	case DW_TAG_imported_unit:
-		break; // We don't support imported units yet, so to avoid segfaults
 	case DW_TAG_array_type:
 		tag = die__create_new_array(die, cu, conf);	break;
 	case DW_TAG_string_type: // FORTRAN stuff, looks like an array
@@ -2059,12 +2077,70 @@ static struct tag *__die__process_tag(Dwarf_Die *die, struct cu *cu,
 	return tag;
 }
 
-static int die__process_unit(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+static int __die__process_unit(Dwarf_Die *die, struct cu *cu, bool from_imported_unit_expansion_from_alt, struct conf_load *conf);
+
+static int die__process_imported_unit(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
+	Dwarf_Attribute attr_mem, *attr = dwarf_attr(die, DW_AT_import, &attr_mem);
+	int err = 0;
+
+	fprintf(stderr, "> %30s:%4d cu: %p off %#" PRIx64 " imported_unit\n", __func__, __LINE__, cu, dwarf_dieoffset(die));
+
+	if (attr == NULL) {
+		fprintf(stderr, "%s: dwarf_attr(die, DW_AT_import, &attr_mem)\n", __func__);
+		return -ENOMEM;
+	}
+
+	Dwarf_Die child;
+
+	if (dwarf_formref_die(attr, &child) != NULL &&
+	    dwarf_tag(&child) == DW_TAG_partial_unit &&
+	    dwarf_child(&child, &child) == 0) {
+		// Check if we need to use the DWARF offset to DIE hashtables for the alternate DWARF
+		// aka .dwz
+		bool from_imported_unit_expansion_from_alt = attr->form == DW_FORM_GNU_ref_alt;
+
+		err = __die__process_unit(&child, cu, from_imported_unit_expansion_from_alt, conf);
+	}
+
+	fprintf(stderr, "< %30s:%4d cu: %p off %#" PRIx64 " imported_unit\n", __func__, __LINE__, cu, dwarf_dieoffset(die));
+
+	return err;
+}
+
+static int __die__process_unit(Dwarf_Die *die, struct cu *cu, bool from_imported_unit_expansion_from_alt, struct conf_load *conf)
+{
+	int err = 0;
+
+	fprintf(stderr, "> %30s:%4d from_imported_unit_expansion_from_alt=%d, conf->alt_dwarf=%d\n", __func__, __LINE__, from_imported_unit_expansion_from_alt, conf->alt_dwarf);
+
+	// Here if from_imported_unit_expansion_from_alt is set that is because
+	// we're processing tags from a DW_TAG_imported_unit from an alt DWARF
+	// file, so since they are coming from an alternate DWARF we need to
+	// mark their offsets as such so that lookups will use the alternative
+	// DWARF offset-queued hashtable, otherwise their offsets will clash
+	// with the offsets in the main CU.
+
+	// And since we add subtags we can't just set its dtag->type.from_alt to true here, we need
+	// to tweak conf->alt_dwarf and then restore its previous value.
+
+	conf->from_imported_unit_expansion_from_alt = from_imported_unit_expansion_from_alt;
+
 	do {
+		if (dwarf_tag(die) == DW_TAG_imported_unit) {
+			err = die__process_imported_unit(die, cu, conf);
+
+			if (err)
+				goto out;
+
+			continue;
+		}
+
 		struct tag *tag = die__process_tag(die, cu, 1, conf);
-		if (tag == NULL)
-			return -ENOMEM;
+		if (tag == NULL) {
+			err = -ENOMEM;
+			goto out;
+		}
 
 		if (tag == &unsupported_tag) {
 			// XXX special case DW_TAG_dwarf_procedure, appears when looking at a recent ~/bin/perf
@@ -2077,14 +2153,35 @@ static int die__process_unit(Dwarf_Die *die, struct cu *cu, struct conf_load *co
 
 		uint32_t id;
 		cu__add_tag(cu, tag, &id);
-		cu__hash(cu, tag);
+
+		// We will load the whole alt file, then we will hash it there, no need to do it on the main cu
+		if (!from_imported_unit_expansion_from_alt || conf->alt_dwarf)
+			cu__hash(cu, tag, conf);
+
+		// XXX we need to make this decision about hashing or not in cu__hash() as we need to take care
+		// of DW_TAG_member and other sub tags, not just the ones we see here... So get conf down to cu__hash()
+		// and call it here uncoditionally, cu__hash() will look at both conf->from_imported_unit_expansion_from_alt and
+		// conf->alt_dwarf and decide if it should or not really hash the tag. CONTINUE FROM HERE
+
 		struct dwarf_tag *dtag = tag->priv;
+
+		fprintf(stderr, "%30s:%4d cu: %p off %#" PRIx64 " tag %p type: %#" PRIx64 " dtag->type.from_alt:%d conf->alt_dwarf:%d %s\n", __func__, __LINE__, cu, dtag->id, tag, dtag->type.off, dtag->type.from_alt, conf->alt_dwarf, dwarf_tag_name(tag->tag));
+
 		dtag->small_id = id;
 		if (tag->tag == DW_TAG_unspecified_type)
 			cu->unspecified_type.type = id;
 	} while (dwarf_siblingof(die, die) == 0);
 
+out:
+	conf->from_imported_unit_expansion_from_alt = 0;
+
+	fprintf(stderr, "< %30s:%4d from_imported_unit_expansion_from_alt=%d\n", __func__, __LINE__, from_imported_unit_expansion_from_alt);
 	return 0;
+}
+
+static int die__process_unit(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+{
+	return __die__process_unit(die, cu, /*from_imported_unit_expansion_from_alt=*/false, conf);
 }
 
 static void ftype__recode_dwarf_types(struct tag *tag, struct cu *cu);
@@ -2141,6 +2238,15 @@ find_type:
 check_type:
 		if (dtype == NULL) {
 			tag__print_type_not_found(pos);
+			{
+				struct dwarf_cu *alt_dcu = cu->alt_cu->priv;
+
+				fprintf(stderr, "WARNING %s:%d looking up on alt_cu! dcu->alt=%p, cu->alt_cu->priv=%p\n", __func__, __LINE__, dcu->alt, cu->alt_cu->priv);
+				dtype = dwarf_cu__find_type_by_ref(alt_dcu, &dpos->type);
+				if (dtype != NULL)
+					fprintf(stderr, "WARNING %s:%d found on alt_cu!\n", __func__, __LINE__);
+
+			}
 			continue;
 		}
 next:
@@ -2469,6 +2575,15 @@ find_type:
 check_type:
 	if (dtype == NULL) {
 		tag__print_type_not_found(tag);
+		{
+			struct dwarf_cu *alt_dcu = cu->alt_cu->priv;
+
+			fprintf(stderr, "WARNING %s:%d looking up on alt_cu!\n", __func__, __LINE__);
+			dtype = dwarf_cu__find_type_by_ref(alt_dcu, &dtag->type);
+			if (dtype != NULL)
+				fprintf(stderr, "WARNING %s:%d found on alt_cu!\n", __func__, __LINE__);
+
+		}
 		return 0;
 	}
 out:
@@ -2569,24 +2684,6 @@ static int die__process(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 			warned = true;
 		}
 		return 0; // so that other units can be processed
-	}
-
-	if (tag == DW_TAG_partial_unit) {
-		static bool warned;
-
-		if (!warned) {
-			fprintf(stderr, "WARNING: DW_TAG_partial_unit used, some types will not be considered!\n"
-					"         Probably this was optimized using a tool like 'dwz'\n"
-					"         A future version of pahole will support this.\n");
-			warned = true;
-		}
-		return 0; // so that other units can be processed
-	}
-
-	if (tag != DW_TAG_compile_unit && tag != DW_TAG_type_unit) {
-		fprintf(stderr, "%s: DW_TAG_compile_unit, DW_TAG_type_unit, DW_TAG_partial_unit or DW_TAG_skeleton_unit expected got %s (0x%x)!\n",
-			__FUNCTION__, dwarf_tag_name(tag), tag);
-		return -EINVAL;
 	}
 
 	cu->language = attr_numeric(die, DW_AT_language);
@@ -2751,10 +2848,10 @@ static int cu__set_common(struct cu *cu, struct conf_load *conf,
 	cu->has_addr_info = conf ? conf->get_addr_info : 0;
 
 	GElf_Ehdr ehdr;
-	if (gelf_getehdr(elf, &ehdr) == NULL)
+	if (elf && gelf_getehdr(elf, &ehdr) == NULL)
 		return DWARF_CB_ABORT;
-
-	cu->little_endian = ehdr.e_ident[EI_DATA] == ELFDATA2LSB;
+	else
+		cu->little_endian = ehdr.e_ident[EI_DATA] == ELFDATA2LSB;
 	return 0;
 }
 
@@ -2925,7 +3022,7 @@ static int dwarf_cus__create_and_process_cu(struct dwarf_cus *dcus, Dwarf_Die *c
 
 	if (die__process_and_recode(cu_die, cu, dcus->conf) != 0 ||
 	    cus__finalize(dcus->cus, cu, dcus->conf, thr_data) == LSK__STOP_LOADING)
-		return DWARF_CB_ABORT;
+		return DWARF_CB_OK;
 
        return DWARF_CB_OK;
 }
@@ -3060,6 +3157,62 @@ static int dwarf_cus__process_cus(struct dwarf_cus *dcus)
 	return __dwarf_cus__process_cus(dcus);
 }
 
+static struct cu *cu__new_alt(struct conf_load *conf, Dwarf *alt_dw, struct tag_tables *tables)
+{
+	struct conf_load alt_conf = *conf;
+	uint8_t pointer_size, offset_size;
+	struct dwarf_cu *dcu = NULL;
+	Dwarf_Off off = 0, noff;
+	struct cu *cu = NULL;
+	size_t cuhl;
+
+	fprintf(stderr, "> %30s:%4d\n", __func__, __LINE__);
+
+	alt_conf.alt_dwarf = true;
+
+	while (dwarf_nextcu(alt_dw, off, &noff, &cuhl, NULL, &pointer_size, &offset_size) == 0) {
+		Dwarf_Die die_mem, *cu_die = dwarf_offdie(alt_dw, off + cuhl, &die_mem);
+
+		if (cu_die == NULL)
+			break;
+
+		if (cu == NULL) {
+			cu = cu__new_merge_tables(tables, pointer_size, alt_conf.use_obstack);
+			if (cu == NULL || cu__set_common(cu, &alt_conf, NULL, NULL) != 0)
+				goto out_abort;
+
+			dcu = zalloc(sizeof(*dcu));
+			if (dcu == NULL)
+				goto out_abort;
+
+			if (dwarf_cu__init(dcu, cu))
+				goto out_abort;
+
+			dcu->cu = cu;
+			dcu->type_unit = NULL;
+			cu->priv = dcu;
+			cu->dfops = &dwarf__ops;
+			cu->language = attr_numeric(cu_die, DW_AT_language);
+		}
+
+		Dwarf_Die child;
+		if (dwarf_child(cu_die, &child) == 0) {
+			if (die__process_unit(&child, cu, &alt_conf) != 0)
+				goto out_abort;
+		}
+
+		off = noff;
+	}
+
+	fprintf(stderr, "< %30s:%4d OK\n", __func__, __LINE__);
+	return cu;
+out_abort:
+	dwarf_cu__delete(cu);
+	cu__delete(cu);
+	fprintf(stderr, "< %30s:%4d FAILURE\n", __func__, __LINE__);
+	return NULL;
+}
+
 static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 				     Dwfl_Module *mod, Dwarf *dw, Elf *elf,
 				     const char *filename,
@@ -3070,7 +3223,7 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 	uint8_t pointer_size, offset_size;
 	struct dwarf_cu *dcu = NULL;
 	Dwarf_Off off = 0, noff;
-	struct cu *cu = NULL;
+	struct cu *cu = NULL, *alt_cu = NULL;
 	size_t cuhl;
 
 	while (dwarf_nextcu(dw, off, &noff, &cuhl, NULL, &pointer_size,
@@ -3124,6 +3277,22 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 	if (cu == NULL)
 		return 0;
 
+	// See if this is a dwo, i.e. if we have partial units that have
+	// types pointing to this alternative DWARF file
+	Dwarf *alt_dw = dwarf_getalt(dw);
+	if (alt_dw != NULL) {
+		fprintf(stderr, "%s:%d alt_dw is set!\n", __func__, __LINE__);
+		fprintf(stderr, "%s:%d dcu->alt=%p!\n", __func__, __LINE__, dcu->alt);
+		alt_cu = cu->alt_cu = cu__new_alt(conf, alt_dw, cu->tables);
+		fprintf(stderr, "%s: cu->alt_cu=%p!\n", __func__, cu->alt_cu);
+		if (cu->alt_cu == NULL)
+			goto out_abort;
+
+		if (dcu->alt == NULL)
+			dcu->alt = alt_cu->priv;
+
+	}
+
 	/* process merged cu */
 	if (cu__recode_dwarf_types(cu) != LSK__KEEPIT)
 		goto out_abort;
@@ -3144,6 +3313,7 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 
 out_abort:
 	dwarf_cu__delete(cu);
+	cu__delete(alt_cu);
 	cu__delete(cu);
 	return DWARF_CB_ABORT;
 }
@@ -3175,7 +3345,7 @@ static int cus__load_module(struct cus *cus, struct conf_load *conf,
 		}
 	}
 
-	if (cus__merging_cu(dw, elf)) {
+	if (1 || cus__merging_cu(dw, elf)) {
 		res = cus__merge_and_process_cu(cus, conf, mod, dw, elf, filename,
 						build_id, build_id_len,
 						type_cu ? &type_dcu : NULL);
