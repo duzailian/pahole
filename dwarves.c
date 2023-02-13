@@ -1391,6 +1391,12 @@ void ftype__add_parameter(struct ftype *ftype, struct parameter *parm)
 	list_add_tail(&parm->tag.node, &ftype->parms);
 }
 
+void ftype__add_template_type_parameter(struct ftype *ftype, struct template_type_parameter *parm)
+{
+	++ftype->nr_template_type_parms;
+	list_add_tail(&parm->tag.node, &ftype->template_type_parms);
+}
+
 void lexblock__add_tag(struct lexblock *block, struct tag *tag)
 {
 	list_add_tail(&tag->node, &block->tags);

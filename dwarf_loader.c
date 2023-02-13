@@ -1093,6 +1093,18 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 	return parm;
 }
 
+static struct template_type_parameter *template_type_parameter__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+{
+	struct template_type_parameter *parm = tag__alloc(cu, sizeof(*parm));
+
+	if (parm != NULL) {
+		tag__init(&parm->tag, cu, die);
+		parm->name = attr_string(die, DW_AT_name, conf);
+	}
+
+	return parm;
+}
+
 static struct inline_expansion *inline_expansion__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	struct inline_expansion *exp = tag__alloc(cu, sizeof(*exp));
@@ -1211,6 +1223,7 @@ static void ftype__init(struct ftype *ftype, Dwarf_Die *die, struct cu *cu)
 #endif
 	tag__init(&ftype->tag, cu, die);
 	INIT_LIST_HEAD(&ftype->parms);
+	INIT_LIST_HEAD(&ftype->template_type_parms);
 	ftype->nr_parms	    = 0;
 	ftype->unspec_parms = 0;
 }
@@ -1562,6 +1575,19 @@ static struct tag *die__create_new_parameter(Dwarf_Die *die,
 		*/
 		lexblock__add_tag(lexblock, &parm->tag);
 	}
+
+	return &parm->tag;
+}
+
+static struct tag *die__create_new_template_type_parameter(Dwarf_Die *die, struct ftype *ftype,
+							   struct cu *cu, struct conf_load *conf)
+{
+	struct template_type_parameter *parm = template_type_parameter__new(die, cu, conf);
+
+	if (parm == NULL)
+		return NULL;
+
+	ftype__add_template_type_parameter(ftype, parm);
 
 	return &parm->tag;
 }
@@ -1989,6 +2015,8 @@ static int die__process_function(Dwarf_Die *die, struct ftype *ftype,
 		case DW_TAG_GNU_template_template_param:
 #endif
 		case DW_TAG_template_type_parameter:
+			tag = die__create_new_template_type_parameter(die, ftype, cu, conf);
+			break;
 		case DW_TAG_template_value_parameter:
 			/* FIXME: probably we'll have to attach this as a list of
  			 * template parameters to use at class__fprintf time... 

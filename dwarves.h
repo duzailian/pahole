@@ -825,13 +825,30 @@ static inline const char *parameter__name(const struct parameter *parm)
 	return parm->name;
 }
 
+struct template_type_parameter {
+	struct tag tag;
+	const char *name;
+};
+
+static inline struct template_type_parameter *tag__template_type_parameter(const struct tag *tag)
+{
+	return (struct template_type_parameter *)tag;
+}
+
+static inline const char *template_type_parameter__name(const struct template_type_parameter *parm)
+{
+	return parm->name;
+}
+
 /*
  * tag.tag can be DW_TAG_subprogram_type or DW_TAG_subroutine_type.
  */
 struct ftype {
 	struct tag	 tag;
 	struct list_head parms;
+	struct list_head template_type_parms;
 	uint16_t	 nr_parms;
+	uint16_t	 nr_template_type_parms;
 	uint8_t		 unspec_parms:1; /* just one bit is needed */
 	uint8_t		 optimized_parms:1;
 	uint8_t		 processed:1;
@@ -872,6 +889,8 @@ void ftype__delete(struct ftype *ftype);
 	list_for_each_entry_safe_reverse(pos, n, &(ftype)->parms, tag.node)
 
 void ftype__add_parameter(struct ftype *ftype, struct parameter *parm);
+void ftype__add_template_type_parameter(struct ftype *ftype, struct template_type_parameter *parm);
+
 size_t ftype__fprintf(const struct ftype *ftype, const struct cu *cu,
 		      const char *name, const int inlined,
 		      const int is_pointer, const int type_spacing, bool is_prototype,
